@@ -1,0 +1,158 @@
+<style>
+  body { margin: 0; padding: 12px 14px; font: 12px/1.5 Inter, system-ui, sans-serif; color: var(--figma-color-text, #202124); background: var(--figma-color-bg, #ffffff); }
+  h1 { margin: 0; font-size: 12px; font-weight: 600; white-space: nowrap; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 6px 0 2px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #B5872B; flex: none; }
+  .dot.on { background: #1F9986; }
+  .muted { color: var(--figma-color-text-secondary, #5f6368); }
+  .top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+  #file { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+  #last { margin: 0 0 8px; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #last.error { color: var(--figma-color-text-danger, #B04560); }
+  #feed { margin: 0; padding: 6px 8px; height: 58px; overflow: auto; border: 1px solid var(--figma-color-border, #dadce0); border-radius: 6px; font: 10.5px/1.4 ui-monospace, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+</style>
+
+<div class="top"><h1>Claude Script Runner</h1><span class="muted" id="file"></span></div>
+<div class="row"><span class="dot" id="dot"></span><span id="status">Looking for the bridge on localhost:3055</span></div>
+<div class="muted" id="last">Keep this window open while scripts run.</div>
+<pre id="feed"></pre>
+
+<script>
+  var BRIDGE = 'http://localhost:3055';
+  // Made once per window, so the bridge can tell a reopened window from the one it knew.
+  var SESSION = Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+  // The name of the Figma file this window is in, so the bridge can tell two windows apart.
+  var FILE = '';
+  var dot = document.getElementById('dot');
+  var statusText = document.getElementById('status');
+  var feed = document.getElementById('feed');
+  var fileText = document.getElementById('file');
+  var lastText = document.getElementById('last');
+
+  var connected = false;
+  // The script this window is running: { id, label, since }. The bridge sends one at a time.
+  var running = null;
+
+  function note(line) {
+    feed.textContent += new Date().toLocaleTimeString() + '  ' + line + '\n';
+    feed.scrollTop = feed.scrollHeight;
+  }
+
+  // The status line: the bridge, then what is running and for how long.
+  function render() {
+    dot.className = connected ? 'dot on' : 'dot';
+    if (!connected) statusText.textContent = 'Bridge not found. It starts with the next script.';
+    else if (running) statusText.textContent = 'Running ' + running.label + ', ' + Math.round((Date.now() - running.since) / 1000) + ' s';
+    else statusText.textContent = 'Connected. Waiting for a script.';
+  }
+
+  // The line under it: how the running script is doing, or how the last one ended. An error
+  // stays there, in red, until another script takes its place.
+  function setLast(text, isError) {
+    lastText.textContent = text;
+    lastText.className = isError ? 'error' : 'muted';
+  }
+
+  function runningLine() {
+    var count = exported[running.id] || 0;
+    setLast('Started ' + new Date(running.since).toLocaleTimeString() + (count ? ', ' + count + ' export(s) saved so far' : ''), false);
+  }
+
+  setInterval(render, 1000);
+
+  function sleep(ms) { return new Promise(function (resolve) { setTimeout(resolve, ms); }); }
+
+  // Long-poll: the bridge holds the request until a script arrives or about 25 seconds pass.
+  // The bridge hands over one script at a time, so polling goes on while a script runs.
+  async function loop() {
+    for (;;) {
+      try {
+        var response = await fetch(BRIDGE + '/next?session=' + SESSION + '&file=' + encodeURIComponent(FILE));
+        connected = true;
+        if (response.status === 200) {
+          var job = await response.json();
+          running = { id: job.id, label: job.label || 'script', since: Date.now() };
+          note('Running ' + running.label + ' (' + job.code.length + ' chars)');
+          runningLine();
+          parent.postMessage({ pluginMessage: { type: 'run', id: job.id, code: job.code } }, '*');
+        }
+        render();
+      } catch (e) {
+        connected = false;
+        render();
+        await sleep(2000);
+      }
+    }
+  }
+
+  window.onmessage = async function (event) {
+    var message = event.data && event.data.pluginMessage;
+    if (message && message.type === 'hello') { FILE = message.file || ''; fileText.textContent = FILE; start(); return; }
+    if (message && message.type === 'export') { saveExport(message); return; }
+    if (!message || message.type !== 'result') return;
+    var count = exported[message.id] || 0;
+    delete exported[message.id];
+    var firstLine = String(message.error).split('\n')[0];
+    note(message.ok ? 'Done' + (count ? ', ' + count + ' export(s)' : '') : 'Failed: ' + firstLine);
+    if (running && running.id === message.id) {
+      var took = Math.round((Date.now() - running.since) / 1000);
+      if (message.ok) setLast('Last run: ' + running.label + ', done in ' + took + ' s', false);
+      else setLast(running.label + ' failed: ' + firstLine, true);
+      running = null;
+    }
+    render();
+    deliver(JSON.stringify({ id: message.id, ok: message.ok, value: message.value, error: message.error, logs: message.logs }));
+  };
+
+  // How many PNGs each running script has saved, for the feed.
+  var exported = {};
+
+  // Posts one PNG to the bridge as soon as the script exports it, then tells the sandbox, which
+  // is waiting for the file to be on disk.
+  async function saveExport(message) {
+    var error = null;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        var response = await fetch(BRIDGE + '/export?id=' + message.id + '&name=' + encodeURIComponent(message.name), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: new Uint8Array(message.bytes)
+        });
+        error = response.status === 200 ? null : 'the bridge answered ' + response.status;
+        break;
+      } catch (e) {
+        error = 'the bridge did not take it';
+        await sleep(1000);
+      }
+    }
+    if (!error) exported[message.id] = (exported[message.id] || 0) + 1;
+    if (running && running.id === message.id) runningLine();
+    note(error ? 'Could not save ' + message.name : 'Saved ' + message.name);
+    parent.postMessage({ pluginMessage: { type: 'export-saved', key: message.key, name: message.name, ok: !error, error: error } }, '*');
+  }
+
+  // Posts a result until the bridge answers. The bridge keeps the window for that script until it
+  // has the result, so one lost request must not be the end of it.
+  async function deliver(body) {
+    var waits = [1000, 2000, 4000, 10000];
+    var giveUpAt = Date.now() + 5 * 60 * 1000;
+    for (var attempt = 0; ; attempt++) {
+      try {
+        var response = await fetch(BRIDGE + '/result', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: body });
+        if (response.status === 404) note('The bridge no longer knows that script. Result dropped.');
+        else if (attempt > 0) note('Result sent.');
+        return;
+      } catch (e) {
+        if (attempt === 0) note('Could not send the result back to the bridge. Trying again.');
+        if (Date.now() > giveUpAt) { note('Gave up sending the result after 5 minutes.'); return; }
+        await sleep(waits[Math.min(attempt, waits.length - 1)]);
+      }
+    }
+  }
+
+  // Polling starts once the sandbox has said which file this is, or after a second without it.
+  var started = false;
+  function start() { if (!started) { started = true; loop(); } }
+  parent.postMessage({ pluginMessage: { type: 'ready' } }, '*');
+  setTimeout(start, 1000);
+</script>
